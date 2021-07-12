@@ -33,6 +33,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+// Ref:
+// 这节解释可参考 https://www.cnblogs.com/wellp/p/8877990.html
+
 #include <aloam_velodyne/common.h>
 #include <ceres/ceres.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -74,9 +77,10 @@ int laserCloudCenDepth = 5;
 const int laserCloudWidth = 21;
 const int laserCloudHeight = 21;
 const int laserCloudDepth = 11;
-
+// cube总数量, 长x宽x高, Ref: https://www.cnblogs.com/wellp/p/8877990.html
 const int laserCloudNum = laserCloudWidth * laserCloudHeight * laserCloudDepth;  // 4851
 
+// 记录submap中有效cude的index, 注意submap中cube的最大数量为5*5*5=125
 int laserCloudValidInd[125];
 int laserCloudSurroundInd[125];
 
@@ -94,7 +98,7 @@ pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMap(new pcl::PointCloud<PointT
 // input & output: points in one frame. local --> global
 pcl::PointCloud<PointType>::Ptr laserCloudFullRes(new pcl::PointCloud<PointType>());
 
-// points in every cube
+// points in every cube, 存放cube点云特征的数组
 pcl::PointCloud<PointType>::Ptr laserCloudCornerArray[laserCloudNum];
 pcl::PointCloud<PointType>::Ptr laserCloudSurfArray[laserCloudNum];
 
@@ -144,6 +148,7 @@ void transformUpdate() {
     t_wmap_wodom = t_w_curr - q_wmap_wodom * t_wodom_curr;
 }
 
+// 用mapping的位姿w_curr, 将LiDAR坐标系下的点变换到world坐标系下
 void pointAssociateToMap(PointType const* const pi, PointType* const po) {
     Eigen::Vector3d point_curr(pi->x, pi->y, pi->z);
     Eigen::Vector3d point_w = q_w_curr * point_curr + t_w_curr;
@@ -154,6 +159,7 @@ void pointAssociateToMap(PointType const* const pi, PointType* const po) {
     // po->intensity = 1.0;
 }
 
+// pointAssociateToMap的逆变换, 代码中没有用到
 void pointAssociateTobeMapped(PointType const* const pi, PointType* const po) {
     Eigen::Vector3d point_w(pi->x, pi->y, pi->z);
     Eigen::Vector3d point_curr = q_w_curr.inverse() * (point_w - t_w_curr);
@@ -187,7 +193,7 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry) {
     odometryBuf.push(laserOdometry);
     mBuf.unlock();
 
-    // high frequence publish
+    // high frequency publish
     Eigen::Quaterniond q_wodom_curr;
     Eigen::Vector3d t_wodom_curr;
     q_wodom_curr.x() = laserOdometry->pose.pose.orientation.x;
@@ -198,6 +204,8 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry) {
     t_wodom_curr.y() = laserOdometry->pose.pose.position.y;
     t_wodom_curr.z() = laserOdometry->pose.pose.position.z;
 
+    // 为了保证整体的实时性, 防止Mapping线程导致丢帧, 用上一次的增量map_wodom来更新odometry的位姿,
+    // 旨在用mapping的初始值(可以理解为预测值)来实时输出, 进而实现LOAM整体的实时性
     Eigen::Quaterniond q_w_curr = q_wmap_wodom * q_wodom_curr;
     Eigen::Vector3d t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom;
 
@@ -219,6 +227,7 @@ void process() {
     while (1) {
         while (!cornerLastBuf.empty() && !surfLastBuf.empty() && !fullResBuf.empty() && !odometryBuf.empty()) {
             mBuf.lock();
+            // odometryBuf只保留一个与cornerLastBuf时间同步的最新消息
             while (!odometryBuf.empty() &&
                    odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
                 odometryBuf.pop();
@@ -227,6 +236,7 @@ void process() {
                 break;
             }
 
+            // surfLastBuf只保留一个与cornerLastBuf时间同步的最新消息
             while (!surfLastBuf.empty() &&
                    surfLastBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
                 surfLastBuf.pop();
@@ -235,6 +245,7 @@ void process() {
                 break;
             }
 
+            // fullResBuf只保留一个与cornerLastBuf时间同步的最新消息
             while (!fullResBuf.empty() &&
                    fullResBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
                 fullResBuf.pop();
@@ -278,6 +289,7 @@ void process() {
             t_wodom_curr.z() = odometryBuf.front()->pose.pose.position.z;
             odometryBuf.pop();
 
+            // 清空缓存, 从而保证整体的实时性
             while (!cornerLastBuf.empty()) {
                 cornerLastBuf.pop();
                 printf("drop lidar frame in mapping for real time performance \n");
@@ -287,13 +299,19 @@ void process() {
 
             TicToc t_whole;
 
+            // 上一帧增量wmap_wodom * 本帧odometry位姿wodom_curr, 旨在为本帧Mapping位姿w_curr设置一个初始值
             transformAssociateToMap();
 
             TicToc t_shift;
+            // 计算当前帧位置t_w_curr的IJK坐标, 25/50是格子大小为50, 相当于以50m为单位进行缩放, 为了保存IJK都是正数,
+            // 所以加了laserCloudCenWidth/Height/Depth的偏移, 来使得当前位置尽量位于submap的中心处.
+            // laserCloudCenWidth/Height/Depth会动态调整, 来保证当前位置尽量位于submap的中心处
             int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;
             int centerCubeJ = int((t_w_curr.y() + 25.0) / 50.0) + laserCloudCenHeight;
             int centerCubeK = int((t_w_curr.z() + 25.0) / 50.0) + laserCloudCenDepth;
 
+            // 由于取余是向零取整, 为了不使(-50, 50)求余后都向零偏移, 当被求余数为负时求余结果统一向左偏移一个单位,
+            // 即减1
             if (t_w_curr.x() + 25.0 < 0) centerCubeI--;
             if (t_w_curr.y() + 25.0 < 0) centerCubeJ--;
             if (t_w_curr.z() + 25.0 < 0) centerCubeK--;
@@ -475,11 +493,13 @@ void process() {
             int laserCloudValidNum = 0;
             int laserCloudSurroundNum = 0;
 
+            // 向IJ坐标轴的正负方向各拓展2个cube, K坐标轴的正负方向各拓展一个cube, 这些cube即是submap的范围
             for (int i = centerCubeI - 2; i <= centerCubeI + 2; i++) {
                 for (int j = centerCubeJ - 2; j <= centerCubeJ + 2; j++) {
                     for (int k = centerCubeK - 1; k <= centerCubeK + 1; k++) {
                         if (i >= 0 && i < laserCloudWidth && j >= 0 && j < laserCloudHeight && k >= 0 &&
-                            k < laserCloudDepth) {
+                            k < laserCloudDepth) {  // 如果坐标合法
+                            // 记录submap中所有cube的index, 记为有效index
                             laserCloudValidInd[laserCloudValidNum] =
                                 i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k;
                             laserCloudValidNum++;
@@ -493,6 +513,7 @@ void process() {
 
             laserCloudCornerFromMap->clear();
             laserCloudSurfFromMap->clear();
+            // 将有效index中的cube的点云叠加到一起组成submap的特征点云
             for (int i = 0; i < laserCloudValidNum; i++) {
                 *laserCloudCornerFromMap += *laserCloudCornerArray[laserCloudValidInd[i]];
                 *laserCloudSurfFromMap += *laserCloudSurfArray[laserCloudValidInd[i]];
@@ -535,7 +556,10 @@ void process() {
                     for (int i = 0; i < laserCloudCornerStackNum; i++) {
                         pointOri = laserCloudCornerStack->points[i];
                         // double sqrtDis = pointOri.x * pointOri.x + pointOri.y * pointOri.y + pointOri.z * pointOri.z;
+                        // submap的点云是world坐标系, 而当前帧的点云都是LiDAR坐标系, 所以在搜寻最近邻点时,
+                        // 先用预测的Mapping位姿w_curr, 将LiDAR坐标系下的特征点变换到world坐标系下
                         pointAssociateToMap(&pointOri, &pointSel);
+                        // 寻找距离当前帧最近的5个点
                         kdtreeCornerFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis);
 
                         if (pointSearchSqDis[4] < 1.0) {
@@ -548,8 +572,9 @@ void process() {
                                 center = center + tmp;
                                 nearCorners.push_back(tmp);
                             }
-                            center = center / 5.0;
+                            center = center / 5.0;  // 计算5个最近邻点的中心
 
+                            // 方差
                             Eigen::Matrix3d covMat = Eigen::Matrix3d::Zero();
                             for (int j = 0; j < 5; j++) {
                                 Eigen::Matrix<double, 3, 1> tmpZeroMean = nearCorners[j] - center;
@@ -562,9 +587,11 @@ void process() {
                             // note Eigen library sort eigenvalues in increasing order
                             Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
                             Eigen::Vector3d curr_point(pointOri.x, pointOri.y, pointOri.z);
+                            // 如果最大的特征值 >> 其他特征值, 则5个点呈线性分布, 否则认为其直线不够直
                             if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1]) {
                                 Eigen::Vector3d point_on_line = center;
                                 Eigen::Vector3d point_a, point_b;
+                                // 从中心点沿着方向向量向两端移动0.1m, 构造线上的两个点
                                 point_a = 0.1 * unit_direction + point_on_line;
                                 point_b = -0.1 * unit_direction + point_on_line;
 
@@ -600,8 +627,10 @@ void process() {
                         pointAssociateToMap(&pointOri, &pointSel);
                         kdtreeSurfFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis);
 
+                        // 平面一般方程为Ax + By + Cz + 1 = 0.
                         Eigen::Matrix<double, 5, 3> matA0;
                         Eigen::Matrix<double, 5, 1> matB0 = -1 * Eigen::Matrix<double, 5, 1>::Ones();
+                        // 或者表示为 matA0 * norm(A, B, C) = matB0
                         if (pointSearchSqDis[4] < 1.0) {
                             for (int j = 0; j < 5; j++) {
                                 matA0(j, 0) = laserCloudSurfFromMap->points[pointSearchInd[j]].x;
@@ -618,11 +647,12 @@ void process() {
                             bool planeValid = true;
                             for (int j = 0; j < 5; j++) {
                                 // if OX * n > 0.2, then plane is not fit well
+                                // 点到平面的距离, 检查平面是否足够平
                                 if (fabs(norm(0) * laserCloudSurfFromMap->points[pointSearchInd[j]].x +
                                          norm(1) * laserCloudSurfFromMap->points[pointSearchInd[j]].y +
                                          norm(2) * laserCloudSurfFromMap->points[pointSearchInd[j]].z +
                                          negative_OA_dot_norm) > 0.2) {
-                                    planeValid = false;
+                                    planeValid = false;  // 平面没有拟合好, 不够平
                                     break;
                                 }
                             }
@@ -678,12 +708,18 @@ void process() {
             } else {
                 ROS_WARN("time Map corner and surf num are not enough");
             }
+
+            // 完成ICP(迭代两次)的特征匹配后, 用最后匹配计算出的优化变量w_curr, 更新增量wmap_wodom,
+            // 为下一次mapping做准备
             transformUpdate();
 
             TicToc t_add;
+            // 将当前帧的特征点云, 逐点进行操作, 转换到world坐标系下并添加到对应位置的cube中
             for (int i = 0; i < laserCloudCornerStackNum; i++) {
+                // 坐标系转换, LiDAR => World
                 pointAssociateToMap(&laserCloudCornerStack->points[i], &pointSel);
 
+                // 计算本次的特征点的IJK坐标, 进而确定添加到哪个cube中
                 int cubeI = int((pointSel.x + 25.0) / 50.0) + laserCloudCenWidth;
                 int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
                 int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
@@ -719,6 +755,7 @@ void process() {
             printf("add points time %f ms\n", t_add.toc());
 
             TicToc t_filter;
+            // 对已经存有点云的cube全部重新进行一次降采样
             for (int i = 0; i < laserCloudValidNum; i++) {
                 int ind = laserCloudValidInd[i];
 

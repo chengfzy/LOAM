@@ -75,7 +75,11 @@ int N_SCANS = 0;  // 激光雷达线数
 float cloudCurvature[400000];     //点云曲率, 40000为一帧点云中点的最大数量
 int cloudSortInd[400000];         //曲率对应的点的index
 int cloudNeighborPicked[400000];  //点是否被筛选过的标志, 0:筛选过, 1: 筛选过
-//点分类标号, 2: 曲率很大,  1: 曲率比较大, 0: 曲率比较小, -1: 曲率很小. 其中1包括2, 0包括1. 0和1构成了点云全部的点
+//点分类标号,
+// 2: 曲率很大, sharp
+// 1: 曲率比较大, less sharp, 包含2
+// 0: 曲率比较小, less flat, 包括-1. 因为点最多, 最后会降采样
+// -1: 曲率很小, sharp
 int cloudLabel[400000];
 
 bool comp(int i, int j) { return (cloudCurvature[i] < cloudCurvature[j]); }

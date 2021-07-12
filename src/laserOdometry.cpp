@@ -59,7 +59,7 @@
 
 int corner_correspondence = 0, plane_correspondence = 0;
 
-constexpr double SCAN_PERIOD = 0.1;
+constexpr double SCAN_PERIOD = 0.1;  // 扫描周期, velodyne频率10Hz, 周期0.1s
 constexpr double DISTANCE_SQ_THRESHOLD = 25;
 constexpr double NEARBY_SCAN = 2.5;
 
@@ -105,7 +105,12 @@ std::queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
 std::mutex mBuf;
 
-// undistort lidar point
+/**
+ * @brief 将当前点云中相对第一个点去除因匀速运行产生的畸变, 相对于得到点云在扫描开始位置时静止扫描得到的点云
+ *
+ * @param pi    输入点云
+ * @param po    输出点云
+ */
 void TransformToStart(PointType const* const pi, PointType* const po) {
     // interpolation ratio
     double s;
@@ -126,7 +131,12 @@ void TransformToStart(PointType const* const pi, PointType* const po) {
 }
 
 // transform all lidar points to the start of the next frame
-
+/**
+ * @brief 将当前点云中相对最后一个点去除因匀速运行产生的畸变, 相对于得到点云在扫描结果位置时静止扫描得到的点云
+ *
+ * @param pi    输入点云
+ * @param po    输出点云
+ */
 void TransformToEnd(PointType const* const pi, PointType* const po) {
     // undistort point first
     pcl::PointXYZI un_point_tmp;
@@ -254,6 +264,7 @@ int main(int argc, char** argv) {
             TicToc t_whole;
             // initializing
             if (!systemInited) {
+                // 第一次不进行匹配, 仅仅是保存数据, 为下次匹配提供target
                 systemInited = true;
                 std::cout << "Initialization finished \n";
             } else {
@@ -261,6 +272,7 @@ int main(int argc, char** argv) {
                 int surfPointsFlatNum = surfPointsFlat->points.size();
 
                 TicToc t_opt;
+                // 点到线, 以及点到面的ICP, 迭代两次
                 for (size_t opti_counter = 0; opti_counter < 2; ++opti_counter) {
                     corner_correspondence = 0;
                     plane_correspondence = 0;
@@ -280,24 +292,32 @@ int main(int argc, char** argv) {
 
                     TicToc t_data;
                     // find correspondence for corner features
+                    // 对本次接收到的曲率最小的点(即Edge Point), 从上次接收到的曲率比较小的点(即上一帧)中找到两点j, l,
+                    // 并与当前点i组成平面. 点j使用kd-tree从上一帧查找最近点, 点l从上一帧中查找
+                    // 另外一个在同一线中查找满足要求的, 第三个在不同线中查找满足要求的 Ref:
+                    // https://zhuanlan.zhihu.com/p/111388877
                     for (int i = 0; i < cornerPointsSharpNum; ++i) {
                         TransformToStart(&(cornerPointsSharp->points[i]), &pointSel);
                         kdtreeCornerLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
 
-                        int closestPointInd = -1, minPointInd2 = -1;
-                        if (pointSearchSqDis[0] < DISTANCE_SQ_THRESHOLD) {
+                        int closestPointInd = -1, minPointInd2 = -1;        // 点j,l对应的index
+                        if (pointSearchSqDis[0] < DISTANCE_SQ_THRESHOLD) {  // 小于阈值, 则该点有效
                             closestPointInd = pointSearchInd[0];
                             int closestPointScanID = int(laserCloudCornerLast->points[closestPointInd].intensity);
 
                             double minPointSqDis2 = DISTANCE_SQ_THRESHOLD;
-                            // search in the direction of increasing scan line
+                            // 先从正方向查找, search in the direction of increasing scan line
                             for (int j = closestPointInd + 1; j < (int)laserCloudCornerLast->points.size(); ++j) {
                                 // if in the same scan line, continue
-                                if (int(laserCloudCornerLast->points[j].intensity) <= closestPointScanID) continue;
+                                if (int(laserCloudCornerLast->points[j].intensity) <= closestPointScanID) {
+                                    continue;
+                                }
 
                                 // if not in nearby scans, end the loop
-                                if (int(laserCloudCornerLast->points[j].intensity) > (closestPointScanID + NEARBY_SCAN))
+                                if (int(laserCloudCornerLast->points[j].intensity) >
+                                    (closestPointScanID + NEARBY_SCAN)) {
                                     break;
+                                }
 
                                 double pointSqDis = (laserCloudCornerLast->points[j].x - pointSel.x) *
                                                         (laserCloudCornerLast->points[j].x - pointSel.x) +
@@ -313,7 +333,7 @@ int main(int argc, char** argv) {
                                 }
                             }
 
-                            // search in the direction of decreasing scan line
+                            // 再从反方向查找, search in the direction of decreasing scan line
                             for (int j = closestPointInd - 1; j >= 0; --j) {
                                 // if in the same scan line, continue
                                 if (int(laserCloudCornerLast->points[j].intensity) >= closestPointScanID) continue;
@@ -474,6 +494,7 @@ int main(int argc, char** argv) {
                 }
                 printf("optimization twice time %f \n", t_opt.toc());
 
+                // 用最新计算出的位姿增量, 更新上一帧的位姿, 从而得到当前帧的位姿, 注意这里的位姿均是在世界坐标系下
                 t_w_curr = t_w_curr + q_w_curr * t_last_curr;
                 q_w_curr = q_w_curr * q_last_curr;
             }
@@ -540,12 +561,14 @@ int main(int argc, char** argv) {
             if (frameCount % skipFrameNum == 0) {
                 frameCount = 0;
 
+                // 将less sharp的点发送给laserMapping
                 sensor_msgs::PointCloud2 laserCloudCornerLast2;
                 pcl::toROSMsg(*laserCloudCornerLast, laserCloudCornerLast2);
                 laserCloudCornerLast2.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
                 laserCloudCornerLast2.header.frame_id = "/camera";
                 pubLaserCloudCornerLast.publish(laserCloudCornerLast2);
 
+                // 将less flat的点发送给laserMapping
                 sensor_msgs::PointCloud2 laserCloudSurfLast2;
                 pcl::toROSMsg(*laserCloudSurfLast, laserCloudSurfLast2);
                 laserCloudSurfLast2.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
