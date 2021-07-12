@@ -88,9 +88,8 @@ ros::Publisher pubSurfPointsLessFlat;
 ros::Publisher pubRemovePoints;
 std::vector<ros::Publisher> pubEachScan;
 
-bool PUB_EACH_LINE = false;
-
-double MINIMUM_RANGE = 0.1;
+bool PUB_EACH_LINE = false;  // 是否publish每个scan的点
+double MINIMUM_RANGE = 0.1;  // 阈值, 表示是否是比较近的点
 
 /**
  * @brief 去掉点云中比较近的点
